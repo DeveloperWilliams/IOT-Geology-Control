@@ -9,14 +9,18 @@ import {
   StyleSheet,
   ActivityIndicator,
   Switch,
+  Platform,
 } from "react-native";
+import styles from "../components/style";
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Animatable from "react-native-animatable";
 import { useRouter, useLocalSearchParams } from "expo-router";
 import * as Location from "expo-location";
 import { Audio } from "expo-av";
+import BluetoothManager, { BluetoothDevice } from "react-native-bluetooth-classic";
 
+// SVG and animation imports
 import Svg, { Path } from "react-native-svg";
 import Animated, {
   useSharedValue,
@@ -25,14 +29,28 @@ import Animated, {
   withTiming,
   Easing,
 } from "react-native-reanimated";
-
 const AnimatedPath = Animated.createAnimatedComponent(Path);
+
+// Dimensions
 import { Dimensions } from "react-native";
 const { width: screenWidth } = Dimensions.get("window");
 
+// Audio files
 const beepSound = require("../assets/beep.mp3");
+const audioFiles = {
+  813: require("../assets/813hz.wav"),
+  559: require("../assets/559hz.wav"),
+  407: require("../assets/407hz.wav"),
+  254: require("../assets/254hz.wav"),
+  203: require("../assets/203hz.wav"),
+  153: require("../assets/153hz.wav"),
+  102: require("../assets/102hz.wav"),
+  33: require("../assets/33hz.wav"),
+};
+
 const primaryColor = "#6C63FF";
 const frequencyList = [813, 559, 407, 254, 203, 153, 102, 33];
+const DEVICE_ADDRESS = "3C:8A:1F:9C:45:D4"; // Bluetooth device MAC address
 
 interface StationMeasurement {
   frequency: number;
@@ -99,28 +117,22 @@ export default function DataEntryScreen() {
     latitude: number;
     longitude: number;
   } | null>(null);
-
   const [currentSound, setCurrentSound] = useState<Audio.Sound | null>(null);
   const phase = useSharedValue(0);
   const [isAcquiring, setIsAcquiring] = useState(false);
   const [usePhoneSignal, setUsePhoneSignal] = useState(false);
 
-  const audioFiles = {
-    813: require("../assets/813hz.wav"),
-    559: require("../assets/559hz.wav"),
-    407: require("../assets/407hz.wav"),
-    254: require("../assets/254hz.wav"),
-    203: require("../assets/203hz.wav"),
-    153: require("../assets/153hz.wav"),
-    102: require("../assets/102hz.wav"),
-    33: require("../assets/33hz.wav"),
-  };
+  // Bluetooth state
+  const [bluetoothDevice, setBluetoothDevice] = useState<BluetoothDevice | null>(null);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [isBluetoothConnected, setIsBluetoothConnected] = useState(false);
 
-  // Add these animation constants
+  // Waveform constants
   const WAVEFORM_HEIGHT = 120;
   const AMPLITUDE = 50;
   const WAVELENGTH_FACTOR = 150;
 
+  // Animation properties
   const animatedProps = useAnimatedProps(() => {
     const path: string[] = [];
     const frequency = frequencyList[currentFrequencyIndex];
@@ -129,7 +141,7 @@ export default function DataEntryScreen() {
 
     for (let x = 0; x <= screenWidth; x += 2) {
       const y = shouldAnimate
-        ? WAVEFORM_HEIGHT / 2 + // Center vertically
+        ? WAVEFORM_HEIGHT / 2 + 
           AMPLITUDE *
             Math.sin((x / wavelength) * 2 * Math.PI + phase.value) *
             Math.sin(phase.value / 2)
@@ -143,6 +155,7 @@ export default function DataEntryScreen() {
     };
   });
 
+  // Animation effect
   useEffect(() => {
     if (isAcquiring && usePhoneSignal) {
       phase.value = withRepeat(
@@ -153,15 +166,11 @@ export default function DataEntryScreen() {
         -1
       );
     } else {
-      phase.value = 0; // Reset to straight line
+      phase.value = 0;
     }
   }, [currentFrequencyIndex, isAcquiring, usePhoneSignal]);
 
-  // Add this effect to reset acquisition state when frequency changes
-  useEffect(() => {
-    setIsAcquiring(false);
-  }, [currentFrequencyIndex]);
-
+  // Cleanup effect
   useEffect(() => {
     return () => {
       const unloadAudio = async () => {
@@ -171,8 +180,93 @@ export default function DataEntryScreen() {
         }
       };
       unloadAudio();
+      
+      // Disconnect Bluetooth on unmount
+      const disconnectBluetooth = async () => {
+        if (bluetoothDevice && isBluetoothConnected) {
+          try {
+            await bluetoothDevice.disconnect();
+            console.log("Bluetooth disconnected");
+          } catch (error) {
+            console.error("Bluetooth disconnect error:", error);
+          }
+        }
+      };
+      disconnectBluetooth();
     };
-  }, [currentSound]);
+  }, [currentSound, bluetoothDevice, isBluetoothConnected]);
+
+  // Initialize GPS
+  useEffect(() => {
+    (async () => {
+      let { status } = await Location.requestForegroundPermissionsAsync();
+      if (status === "granted") {
+        const location = await Location.getCurrentPositionAsync({});
+        setGps(location.coords);
+      }
+    })();
+  }, []);
+
+  // Initialize Bluetooth
+  useEffect(() => {
+    const initBluetooth = async () => {
+      try {
+        // Check and request Bluetooth permissions (Android 12+ requires runtime permission)
+        let granted = true;
+        if (Platform.OS === "android" && Platform.Version >= 31) {
+          // @ts-ignore
+          const { PermissionsAndroid } = require("react-native");
+          const btScan = await PermissionsAndroid.request(
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+            {
+              title: "Bluetooth Permission",
+              message: "App needs access to scan for Bluetooth devices.",
+              buttonNeutral: "Ask Me Later",
+              buttonNegative: "Cancel",
+              buttonPositive: "OK",
+            }
+          );
+          const btConnect = await PermissionsAndroid.request(
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+            {
+              title: "Bluetooth Permission",
+              message: "App needs access to connect to Bluetooth devices.",
+              buttonNeutral: "Ask Me Later",
+              buttonNegative: "Cancel",
+              buttonPositive: "OK",
+            }
+          );
+          granted =
+            btScan === PermissionsAndroid.RESULTS.GRANTED &&
+            btConnect === PermissionsAndroid.RESULTS.GRANTED;
+        }
+        if (!granted) {
+          Alert.alert(
+            "Permission Required",
+            "Bluetooth permission is required to connect to the device"
+          );
+          return;
+        }
+
+        // Enable Bluetooth if not enabled
+        const enabled = await BluetoothManager.isBluetoothEnabled();
+        if (!enabled) {
+          Alert.alert(
+            "Bluetooth Disabled",
+            "Please enable Bluetooth manually in your device settings."
+          );
+          return;
+        }
+      } catch (error) {
+        console.error("Bluetooth init error:", error);
+        Alert.alert("Bluetooth Error", "Failed to initialize Bluetooth");
+      }
+    };
+
+    if (step === 1) {
+      initBluetooth();
+    }
+  }, [step]);
 
   // Load existing data for editing
   useEffect(() => {
@@ -191,23 +285,12 @@ export default function DataEntryScreen() {
     loadExistingData();
   }, [isEditing, params.existingData, params.currentStation]);
 
-  // Initialize GPS
+  // Reset acquisition when frequency changes
   useEffect(() => {
-    (async () => {
-      let { status } = await Location.requestForegroundPermissionsAsync();
-      if (status === "granted") {
-        const location = await Location.getCurrentPositionAsync({});
-        setGps(location.coords);
-      }
-    })();
-  }, []);
+    setIsAcquiring(false);
+  }, [currentFrequencyIndex]);
 
-  useEffect(() => {
-    if (step === 1) {
-      handleFetchData();
-    }
-  }, [currentFrequencyIndex, step]);
-
+  // Measurement calculations
   const calculateMeasurements = (
     freq: number,
     txCurrent: string,
@@ -238,11 +321,47 @@ export default function DataEntryScreen() {
     };
   };
 
-  // Fetch data from the sensor
+  // Connect to Bluetooth device
+  const connectToDevice = useCallback(async () => {
+    if (isBluetoothConnected || isConnecting) return;
 
+    setIsConnecting(true);
+    setSensorStatus("loading");
+
+    try {
+      // Discover paired devices
+      const paired = await BluetoothManager.getBondedDevices();
+      const device = paired.find((d: BluetoothDevice) => d.address === DEVICE_ADDRESS);
+      if (!device) {
+        throw new Error("Device not found. Please pair the device first.");
+      }
+      await device.connect();
+      setBluetoothDevice(device);
+      setIsBluetoothConnected(true);
+      setSensorStatus("success");
+      console.log("Bluetooth connected successfully");
+    } catch (error) {
+      console.error("Bluetooth connection error:", error);
+      setSensorStatus("error");
+      Alert.alert(
+        "Connection Failed",
+        "Could not connect to the measurement device"
+      );
+    } finally {
+      setIsConnecting(false);
+    }
+  }, [isBluetoothConnected, isConnecting]);
+
+  // Fetch data from Bluetooth device
   const handleFetchData = useCallback(async () => {
-    setIsAcquiring(true); // Show loading spinner
-    setSensorStatus("loading"); // Set status to loading
+    // Connect if not already connected
+    if (!isBluetoothConnected) {
+      await connectToDevice();
+      return;
+    }
+
+    setIsAcquiring(true);
+    setSensorStatus("loading");
 
     try {
       // Stop and unload current sound if exists
@@ -269,18 +388,20 @@ export default function DataEntryScreen() {
         await sound.playAsync();
       }
 
-      // Send POST request with current frequency
-      const response = await fetch("http://192.168.4.1/start", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          frequency: frequencyList[currentFrequencyIndex],
-        }),
-      });
+      // Send frequency command via Bluetooth
+      if (!bluetoothDevice) throw new Error("No Bluetooth device connected");
+      
+      // Send frequency command
+      const command = `${frequencyList[currentFrequencyIndex]}\n`;
+      await bluetoothDevice.write(command);
+      console.log("Sent command:", command);
 
-      const data = await response.json();
+      // Read response (may need to implement timeout manually)
+      const response = await bluetoothDevice.read();
+      console.log("Received response:", response);
+      
+      // Parse JSON response
+      const data = JSON.parse(response.trim());
 
       // Perform calculations
       const calculations = calculateMeasurements(
@@ -289,7 +410,7 @@ export default function DataEntryScreen() {
         (data.voltage * 1000).toFixed(2)
       );
 
-      // Update station measurements state
+      // Update station measurements
       setStationMeasurements((prev) => ({
         ...prev,
         [frequencyList[currentFrequencyIndex]]: {
@@ -309,44 +430,46 @@ export default function DataEntryScreen() {
         },
       }));
 
-      // Optional: confirmation beep
+      // Play confirmation beep
       const { sound: confirmationBeep } = await Audio.Sound.createAsync(
         beepSound
       );
       await confirmationBeep.playAsync();
 
-      setSensorStatus("success"); // Data fetched successfully
+      setSensorStatus("success");
+      console.log("Data acquisition successful");
     } catch (error) {
-      console.error("Sensor data fetch error:", error);
+      console.error("Data acquisition error:", error);
       setSensorStatus("error");
-      Alert.alert("Sensor Error", "Failed to fetch sensor data");
+      setIsBluetoothConnected(false);
+      setBluetoothDevice(null);
+      
+      Alert.alert(
+        "Acquisition Failed",
+        typeof error === "object" && error !== null && "message" in error
+          ? (error as { message?: string }).message || "Failed to get measurement data"
+          : "Failed to get measurement data"
+      );
     } finally {
-      // Ensure cleanup of current sound if it's still set
       if (currentSound) {
         await currentSound.stopAsync();
         await currentSound.unloadAsync();
       }
-
-      setIsAcquiring(false); // Hide loading spinner
-      setSensorStatus("idle"); // Reset sensor status
+      setIsAcquiring(false);
     }
   }, [
+    isBluetoothConnected,
+    bluetoothDevice,
     currentFrequencyIndex,
     usePhoneSignal,
     currentSound,
-    frequencyList,
-    audioFiles,
+    connectToDevice,
     gps,
     currentStation,
     commonParams,
-    beepSound,
-    calculateMeasurements,
-    setStationMeasurements,
-    setCurrentSound,
-    setIsAcquiring,
-    setSensorStatus,
   ]);
 
+  // Save station data
   const handleSaveStation = async () => {
     const stationData = Object.values(stationMeasurements);
     if (stationData.length !== frequencyList.length) {
@@ -356,6 +479,8 @@ export default function DataEntryScreen() {
 
     const updatedData = {
       ...resultData,
+      name: resultName,
+      common: commonParams,
       stations: { ...resultData.stations, [currentStation]: stationData },
     };
 
@@ -375,6 +500,7 @@ export default function DataEntryScreen() {
       setStationMeasurements({});
       Alert.alert("Success", `Station ${currentStation} saved successfully`);
     } catch (error) {
+      console.error("Save error:", error);
       Alert.alert("Error", "Failed to save station data");
     }
   };
@@ -493,21 +619,25 @@ export default function DataEntryScreen() {
                 sensorStatus === "error" && styles.sensorError,
               ]}
               onPress={handleFetchData}
-              disabled={sensorStatus === "loading"}
+              disabled={sensorStatus === "loading" || isConnecting}
             >
-              {sensorStatus === "loading" ? (
+              {sensorStatus === "loading" || isConnecting ? (
                 <ActivityIndicator color="#FFF" />
               ) : (
                 <>
                   <Ionicons
-                    name={sensorStatus === "error" ? "alert-circle" : "radio"}
+                    name={
+                      isBluetoothConnected 
+                        ? "bluetooth" 
+                        : "bluetooth-outline"
+                    }
                     size={32}
                     color="#FFF"
                   />
                   <Text style={styles.sensorButtonText}>
-                    {sensorStatus === "error"
-                      ? "Retry Connection"
-                      : "Acquire Data"}
+                    {isBluetoothConnected
+                      ? "Acquire Data"
+                      : "Connect Device"}
                   </Text>
                 </>
               )}
@@ -529,6 +659,18 @@ export default function DataEntryScreen() {
                 </Text>
               </View>
             </View>
+          </View>
+
+          {/* Bluetooth status indicator */}
+          <View style={localStyles.bluetoothStatus}>
+            <Text style={[
+              localStyles.statusText,
+              isBluetoothConnected ? localStyles.connected : localStyles.disconnected
+            ]}>
+              {isBluetoothConnected 
+                ? "Device Connected" 
+                : "Device Disconnected"}
+            </Text>
           </View>
 
           <View style={styles.visualizationContainer}>
@@ -599,184 +741,21 @@ export default function DataEntryScreen() {
 
 const WAVEFORM_HEIGHT = 160;
 
-const styles = StyleSheet.create({
-  container: {
-    flexGrow: 1,
-    backgroundColor: "#F9F9FB",
-    padding: 16,
+
+// Local styles for this component
+const localStyles = StyleSheet.create({
+  bluetoothStatus: {
+    marginVertical: 10,
+    alignItems: 'center',
   },
-  header: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: 24,
-  },
-  headerTitle: {
-    fontSize: 22,
-    fontFamily: "JosefinSans_600SemiBold",
-    color: primaryColor,
-  },
-  card: {
-    backgroundColor: "#FFF",
-    borderRadius: 16,
-    padding: 24,
-    marginBottom: 16,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 3,
-  },
-  cardTitle: {
-    fontSize: 20,
-    fontFamily: "JosefinSans_600SemiBold",
-    color: "#2D3436",
-    textAlign: "center",
-    marginBottom: 24,
-  },
-  inputGroup: {
-    marginBottom: 20,
-  },
-  label: {
-    fontFamily: "JosefinSans_500Medium",
+  statusText: {
     fontSize: 14,
-    color: "#6C63FF",
-    marginBottom: 8,
+    fontWeight: '500',
   },
-  input: {
-    backgroundColor: "#F8F9FA",
-    borderRadius: 12,
-    padding: 14,
-    fontSize: 16,
-    fontFamily: "JosefinSans_400Regular",
-    borderWidth: 1,
-    borderColor: "#E9ECEF",
+  connected: {
+    color: '#4CAF50',
   },
-  paramGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    justifyContent: "space-between",
-    gap: 12,
-    marginBottom: 24,
-  },
-  paramItem: {
-    width: "48%",
-  },
-  primaryButton: {
-    backgroundColor: primaryColor,
-    borderRadius: 12,
-    padding: 18,
-    alignItems: "center",
-  },
-  buttonText: {
-    color: "#FFF",
-    fontFamily: "JosefinSans_600SemiBold",
-    fontSize: 16,
-  },
-  progressHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: 32,
-  },
-  frequencyLabel: {
-    fontFamily: "JosefinSans_600SemiBold",
-    fontSize: 24,
-    color: "#2D3436",
-  },
-  progressText: {
-    fontFamily: "JosefinSans_500Medium",
-    fontSize: 16,
-    color: primaryColor,
-  },
-  sensorContainer: {
-    marginBottom: 32,
-    alignItems: "center",
-  },
-  sensorButton: {
-    backgroundColor: primaryColor,
-    borderRadius: 100,
-    padding: 24,
-    width: "100%",
-    alignItems: "center",
-    justifyContent: "center",
-    flexDirection: "row",
-    gap: 12,
-    marginBottom: 24,
-  },
-  sensorLoading: {
-    backgroundColor: "#4A90E2",
-  },
-  sensorError: {
-    backgroundColor: "#FF6B6B",
-  },
-  sensorButtonText: {
-    color: "#FFF",
-    fontFamily: "JosefinSans_600SemiBold",
-    fontSize: 16,
-  },
-  dataDisplay: {
-    flexDirection: "row",
-    gap: 16,
-    width: "100%",
-  },
-  dataItem: {
-    flex: 1,
-    backgroundColor: "#F8F9FA",
-    borderRadius: 12,
-    padding: 16,
-    alignItems: "center",
-  },
-  dataLabel: {
-    fontFamily: "JosefinSans_500Medium",
-    fontSize: 14,
-    color: "#6C63FF",
-    marginBottom: 8,
-  },
-  dataValue: {
-    fontFamily: "JosefinSans_600SemiBold",
-    fontSize: 18,
-    color: "#2D3436",
-  },
-  navigationControls: {
-    flexDirection: "row",
-    gap: 12,
-  },
-  navButton: {
-    flex: 1,
-    backgroundColor: "#E9ECEF",
-    borderRadius: 12,
-    padding: 18,
-    alignItems: "center",
-  },
-  navButtonText: {
-    color: primaryColor,
-    fontFamily: "JosefinSans_600SemiBold",
-    fontSize: 16,
-  },
-  disabledButton: {
-    opacity: 0.5,
-  },
-  visualizationContainer: {
-    height: WAVEFORM_HEIGHT,
-    marginVertical: 16,
-    backgroundColor: "#1a1a1a",
-    borderRadius: 12,
-    overflow: "hidden",
-    justifyContent: "center", // Add this to ensure vertical centering
-  },
-  toggleContainer: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    padding: 16,
-    backgroundColor: "#F8F9FA",
-    borderRadius: 12,
-    marginVertical: 16,
-  },
-  toggleLabel: {
-    fontFamily: "JosefinSans_500Medium",
-    fontSize: 16,
-    color: "#2D3436",
+  disconnected: {
+    color: '#F44336',
   },
 });
